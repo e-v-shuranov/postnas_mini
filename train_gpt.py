@@ -21,6 +21,9 @@ from pathlib import Path
 
 import numpy as np
 import sentencepiece as spm
+from postnas.config import PostNASConfig
+from postnas.layer_mask import build_layer_replace_mask
+from postnas.attention_backends import full_causal_attention, local_causal_sliding_window_attention
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -560,6 +563,8 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        backend: str = "full",
+        local_window: int = 128,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -579,6 +584,8 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.backend = backend
+        self.local_window = local_window
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -591,14 +598,23 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
+        if self.backend == "full":
+            y = full_causal_attention(
+                q,
+                k,
+                v,
+                enable_gqa=(self.num_kv_heads != self.num_heads),
+            )
+        elif self.backend == "local":
+            y = local_causal_sliding_window_attention(
+                q,
+                k,
+                v,
+                window=self.local_window,
+                enable_gqa=(self.num_kv_heads != self.num_heads),
+            )
+        else:
+            raise ValueError(f"Unsupported attention backend: {self.backend}")
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -626,11 +642,21 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        attn_backend: str,
+        local_window: int,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(
+            dim,
+            num_heads,
+            num_kv_heads,
+            rope_base,
+            qk_gain_init,
+            backend=attn_backend,
+            local_window=local_window,
+        )
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -659,6 +685,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        postnas_config: PostNASConfig,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -671,6 +698,10 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        layer_replace_mask = build_layer_replace_mask(
+            num_layers=num_layers,
+            selected_indices=postnas_config.replace_layers,
+        )
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -680,6 +711,8 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    attn_backend=postnas_config.backend if postnas_config.enable and layer_replace_mask[i] else "full",
+                    local_window=postnas_config.window,
                 )
                 for i in range(num_layers)
             ]
@@ -733,6 +766,7 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    postnas_config = PostNASConfig.from_env()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -835,6 +869,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        postnas_config=postnas_config,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -897,6 +932,10 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(f"postnas:enabled:{postnas_config.enable}")
+    log0(f"postnas:backend:{postnas_config.backend}")
+    log0(f"postnas:replace_layers:{postnas_config.replace_layers}")
+    log0(f"postnas:window:{postnas_config.window}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
